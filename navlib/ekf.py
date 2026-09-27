@@ -24,7 +24,7 @@ class EkfConfig:
     gyro_noise: float = 0.005       # rad/s per sample
     accel_bias_rw: float = 3e-2     # m/s^2 / sqrt(s): large on purpose -- road grade looks like a fast-changing bias
     gyro_bias_rw: float = 1e-5      # rad/s / sqrt(s)
-    gps_sigma: float = 2.5          # m
+    gps_sigma: float = 25          # m
     mag_sigma: float = np.deg2rad(4.0)
     zupt_sigma: float = 0.02        # m/s
     mag_rate: float = 10.0          # Hz
