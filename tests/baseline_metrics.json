@@ -1,6 +1,0 @@
-{
-  "ekf_pos_rmse_m": 1.7924950872765928,
-  "gps_pos_rmse_m": 3.566661068185434,
-  "outage_ekf_mean_err_m": 32.029900478772774,
-  "outage_dr_mean_err_m": 194.78686164531382
-}
