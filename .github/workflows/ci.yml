@@ -18,6 +18,8 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Build the C++ motor controller (for SIL tests)
+        run: g++ -O2 -std=c++17 -Wall -Wextra motor_sil/controller_cpp/controller.cpp -o motor_sil/controller_cpp/controller
       - run: pytest -m "not slow" -v --junitxml=test-results.xml
       - uses: actions/upload-artifact@v4
         if: always()                           # keep the report even when tests fail
@@ -35,7 +37,14 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Build the C++ motor controller (for SIL tests)
+        run: g++ -O2 -std=c++17 -Wall -Wextra motor_sil/controller_cpp/controller.cpp -o motor_sil/controller_cpp/controller
       - run: pytest -v                         # includes @slow simulation tests
+      - name: Motor SIL scenario suite + latency sweep (both controllers)
+        run: |
+          python motor_sil/run_suite.py --controller python
+          python motor_sil/run_suite.py --controller cpp
+          python motor_sil/latency_sweep.py
       - name: Run the full analysis pipeline (headless)
         run: |
           cd scripts
