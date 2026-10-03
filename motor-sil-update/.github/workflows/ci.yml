@@ -1,0 +1,57 @@
+# GitHub Actions: this file makes GitHub run the tests automatically.
+name: CI
+
+on:
+  push:                    # every time you push commits
+  pull_request:            # every time someone opens/updates a pull request
+  schedule:
+    - cron: "0 7 * * *"    # every night at 07:00 UTC
+  workflow_dispatch:       # a "Run workflow" button in the GitHub UI
+
+jobs:
+  quick-tests:             # fast gate: runs on every push / PR (~1 minute)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4              # download the repo onto the runner
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build the C++ motor controller (for SIL tests)
+        run: g++ -O2 -std=c++17 -Wall -Wextra motor_sil/controller_cpp/controller.cpp -o motor_sil/controller_cpp/controller
+      - run: pytest -m "not slow" -v --junitxml=test-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()                           # keep the report even when tests fail
+        with:
+          name: quick-test-results
+          path: test-results.xml
+
+  full-suite:              # slow gate: nightly or on demand
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build the C++ motor controller (for SIL tests)
+        run: g++ -O2 -std=c++17 -Wall -Wextra motor_sil/controller_cpp/controller.cpp -o motor_sil/controller_cpp/controller
+      - run: pytest -v                         # includes @slow simulation tests
+      - name: Motor SIL scenario suite + latency sweep (both controllers)
+        run: |
+          python motor_sil/run_suite.py --controller python
+          python motor_sil/run_suite.py --controller cpp
+          python motor_sil/latency_sweep.py
+      - name: Run the full analysis pipeline (headless)
+        run: |
+          cd scripts
+          for f in 00_generate_data.py 01_allan.py 02_magcal.py 03_heading.py 04_dead_reckoning.py 05_ekf.py; do
+            python "$f"
+          done
+      - uses: actions/upload-artifact@v4       # plots + metrics.json downloadable from the run page
+        with:
+          name: analysis-results
+          path: results/

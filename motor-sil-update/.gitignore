@@ -1,0 +1,7 @@
+data/*.csv
+results/
+__pycache__/
+*.pyc
+.pytest_cache/
+motor_sil/controller_cpp/controller
+motor_sil/controller_cpp/controller.exe
