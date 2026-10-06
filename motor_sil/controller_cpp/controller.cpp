@@ -1,4 +1,4 @@
-// Motor position controller in C++ -- same protocol and same PID as controller_py.py.
+// Motor controller in C++ (position or velocity) -- same protocol and same PI as controller_py.py.
 // This plays the role of the "production firmware" in software-in-the-loop.
 //
 // Build (Windows, MinGW): g++ -O2 -std=c++17 controller.cpp -o controller.exe -lws2_32
@@ -27,32 +27,48 @@
 
 constexpr double kPi = 3.141592653589793;
 
-// PID on output angle: derivative on measurement, filtered speed estimate, anti-windup.
-class Pid {
- public:
-  Pid(double kp, double ki, double kd, double dt, double counts_per_rev, double d_filter_hz = 50.0)
-      : kp_(kp), ki_(ki), kd_(kd), dt_(dt),
-        rad_per_count_(2 * kPi / counts_per_rev),
-        alpha_(dt / (dt + 1 / (2 * kPi * d_filter_hz))) {}
+// Same controller as controller_py.py: sign-magnitude PI, Arduino-style inputs and outputs.
+struct Command { int pwm, in1, in2; };
 
-  double update(long counts, double target) {
-    double angle = counts * rad_per_count_;
-    if (has_prev_) {
-      double raw_speed = (counts - prev_counts_) * rad_per_count_ / dt_;
-      speed_ += alpha_ * (raw_speed - speed_);
+class ArduinoController {
+ public:
+  ArduinoController(bool position_mode, double kp, double ki, double dt, double counts_per_rev,
+                    double deadband, bool anti_windup)
+      : pos_(position_mode), kp_(kp), ki_(ki), dt_(dt),
+        rad_per_count_(2 * kPi / counts_per_rev), deadband_(deadband), aw_(anti_windup),
+        full_scale_(position_mode ? 2 * kPi : 25.0 * 2 * kPi / 60) {}
+
+  Command update(long counts, int adc) {
+    double ref = adc / 1023.0 * full_scale_;
+    double measured;
+    if (pos_) {
+      measured = counts * rad_per_count_;
+    } else {
+      long prev = has_prev_ ? prev_counts_ : counts;
+      measured = (counts - prev) * rad_per_count_ / dt_;
     }
     prev_counts_ = counts;
     has_prev_ = true;
-    double error = target - angle;
-    double u = kp_ * error + ki_ * integral_ - kd_ * speed_;
-    double u_sat = u > 1.0 ? 1.0 : (u < -1.0 ? -1.0 : u);
-    if (u == u_sat) integral_ += error * dt_;   // anti-windup
-    return u_sat;
+    double error = ref - measured;
+    double u = kp_ * error + ki_ * integral_;
+    bool saturated = std::fabs(u) >= 1.0;
+    if (!(aw_ && saturated)) integral_ += error * dt_;
+    int pwm = static_cast<int>(std::lround(std::fabs(u) * 255));
+    if (pwm > 255) pwm = 255;
+    if (pos_) {
+      if (u > deadband_) return {pwm, 1, 0};
+      if (u < -deadband_) return {pwm, 0, 1};
+      return {0, 0, 0};
+    }
+    return u > 0 ? Command{pwm, 1, 0} : Command{pwm, 0, 0};
   }
 
  private:
-  double kp_, ki_, kd_, dt_, rad_per_count_, alpha_;
-  double integral_ = 0.0, speed_ = 0.0;
+  bool pos_;
+  double kp_, ki_, dt_, rad_per_count_, deadband_;
+  bool aw_;
+  double full_scale_;
+  double integral_ = 0.0;
   long prev_counts_ = 0;
   bool has_prev_ = false;
 };
@@ -90,18 +106,27 @@ static bool send_all(sock_t s, const std::string& msg) {
 }
 
 int main(int argc, char** argv) {
-  int port = -1;
-  double kp = 12.0, ki = 60.0, kd = 0.2, counts_per_rev = 1440.0, dt = 1e-3, gain_scale = 1.0;
+  int port = -1, anti_windup = 1;
+  bool position_mode = true, gains_given = false;
+  double kp = 0, ki = 0, counts_per_rev = 8256.0, dt = 0.01, deadband = 0.0, gain_scale = 1.0;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--port") && i + 1 < argc) port = std::atoi(argv[++i]);
-    else if (!std::strcmp(argv[i], "--gains") && i + 3 < argc) {
-      kp = std::atof(argv[++i]); ki = std::atof(argv[++i]); kd = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) position_mode = std::strcmp(argv[++i], "velocity") != 0;
+    else if (!std::strcmp(argv[i], "--gains") && i + 2 < argc) {
+      kp = std::atof(argv[++i]); ki = std::atof(argv[++i]); gains_given = true;
     } else if (!std::strcmp(argv[i], "--counts-per-rev") && i + 1 < argc) counts_per_rev = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "--dt") && i + 1 < argc) dt = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--deadband") && i + 1 < argc) deadband = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--anti-windup") && i + 1 < argc) anti_windup = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--gain-scale") && i + 1 < argc) gain_scale = std::atof(argv[++i]);
   }
-  if (port < 0) { std::fprintf(stderr, "usage: controller --port N\n"); return 2; }
-  Pid pid(kp * gain_scale, ki * gain_scale, kd * gain_scale, dt, counts_per_rev);
+  if (port < 0) { std::fprintf(stderr, "usage: controller --port N [--mode position|velocity]\n"); return 2; }
+  if (!gains_given) {             // same defaults as controller_py.py
+    kp = position_mode ? 8.0 : 0.6;
+    ki = position_mode ? 1.0 : 10.0;
+  }
+  ArduinoController ctrl(position_mode, kp * gain_scale, ki * gain_scale, dt, counts_per_rev,
+                         deadband, anti_windup != 0);
 
 #ifdef _WIN32
   WSADATA wsa;
@@ -130,10 +155,11 @@ int main(int argc, char** argv) {
     if (tag == "END") break;
     if (tag != "STATE") continue;
     long step, counts;
-    double t, target;
-    in >> step >> t >> counts >> target;
-    double duty = pid.update(counts, target);
-    std::snprintf(out, sizeof(out), "CMD %ld %.17g\n", step, duty);
+    double t;
+    int adc;
+    in >> step >> t >> counts >> adc;
+    Command c = ctrl.update(counts, adc);
+    std::snprintf(out, sizeof(out), "CMD %ld %d %d %d\n", step, c.pwm, c.in1, c.in2);
     if (!send_all(s, out)) break;
   }
   close_sock(s);

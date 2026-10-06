@@ -1,57 +1,78 @@
-"""Motor position controller as a SEPARATE PROGRAM (the "software" in SIL).
+"""Arduino-style controller as a SEPARATE PROGRAM (the "software" in SIL).
 
-It only sees what real firmware would see: encoder COUNTS and the target angle.
-It must estimate speed itself from the counts.
+It sees exactly what the Arduino sees, and outputs exactly what the Arduino outputs:
+  inputs : encoder count (pins 2,3)  +  potentiometer ADC value 0..1023 (pin A0)
+  outputs: PWM 0..255 (pin 9)        +  direction bits IN1, IN2 (pins 6, 8)
 
-Protocol (one line each way per control step, 1 kHz):
+Protocol, one exchange per 10 ms control step:
   controller -> sim : HELLO <name>
-  sim -> controller : STATE <step> <time> <encoder_counts> <target_rad>
-  controller -> sim : CMD <step> <duty>          duty in [-1, 1], must echo <step>
+  sim -> controller : STATE <step> <time> <encoder_counts> <pot_adc>
+  controller -> sim : CMD <step> <pwm> <in1> <in2>        (must echo <step>)
   sim -> controller : END
 
-Control law: PID on output angle
-  * derivative on MEASUREMENT (not error) -> no "kick" when the target jumps
-  * speed from count differences, low-pass filtered (raw differences are very jumpy)
-  * anti-windup: freeze the integrator while the output is saturated
+Control structure (same as the project's Simulink hardware models): sign-magnitude drive
+  u = PI(error);  PWM = |u| * 255 (clipped);  direction from the sign of u
+  position mode : u > +deadband -> forward [1 0],  u < -deadband -> reverse [0 1],  else brake [0 0]
+  velocity mode : u > 0 -> forward [1 0],  else brake [0 0]   (never reverses, as in the project)
 """
 import argparse
 import math
 import socket
 
+POT_FULL_SCALE = {"position": 2 * math.pi,          # pot range -> 0..2*pi rad target
+                  "velocity": 25.0 * 2 * math.pi / 60}  # pot range -> 0..25 RPM target (rad/s)
 
-class PID:
-    def __init__(self, kp, ki, kd, dt, counts_per_rev, d_filter_hz=50.0):
-        self.kp, self.ki, self.kd, self.dt = kp, ki, kd, dt
+
+class ArduinoController:
+    def __init__(self, mode, kp, ki, dt, counts_per_rev, deadband=0.0, anti_windup=False):
+        self.mode, self.kp, self.ki, self.dt = mode, kp, ki, dt
         self.rad_per_count = 2 * math.pi / counts_per_rev
-        self.alpha = dt / (dt + 1 / (2 * math.pi * d_filter_hz))   # 1st-order low-pass
+        self.deadband, self.anti_windup = deadband, anti_windup
         self.integral = 0.0
         self.prev_counts = None
-        self.speed = 0.0
 
-    def update(self, counts, target):
-        angle = counts * self.rad_per_count
-        if self.prev_counts is not None:
-            raw_speed = (counts - self.prev_counts) * self.rad_per_count / self.dt
-            self.speed += self.alpha * (raw_speed - self.speed)
+    def reference(self, adc):
+        return adc / 1023.0 * POT_FULL_SCALE[self.mode]
+
+    def update(self, counts, adc):
+        ref = self.reference(adc)
+        if self.mode == "position":
+            measured = counts * self.rad_per_count
+        else:   # speed = change in counts over one sample (no filtering, like the Simulink model)
+            prev = counts if self.prev_counts is None else self.prev_counts
+            measured = (counts - prev) * self.rad_per_count / self.dt
         self.prev_counts = counts
-        error = target - angle
-        u = self.kp * error + self.ki * self.integral - self.kd * self.speed
-        u_sat = max(-1.0, min(1.0, u))
-        if u == u_sat:                       # anti-windup: integrate only when not saturated
+        error = ref - measured
+        u = self.kp * error + self.ki * self.integral
+        saturated = abs(u) >= 1.0
+        if not (self.anti_windup and saturated):
             self.integral += error * self.dt
-        return u_sat
+        pwm = min(255, int(round(abs(u) * 255)))
+        if self.mode == "position":
+            if u > self.deadband:
+                return pwm, 1, 0
+            if u < -self.deadband:
+                return pwm, 0, 1
+            return 0, 0, 0
+        return (pwm, 1, 0) if u > 0 else (pwm, 0, 0)
+
+
+DEFAULT_GAINS = {"position": (8.0, 1.0), "velocity": (0.6, 10.0)}   # tuned in this SIL
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--gains", type=float, nargs=3, default=[12.0, 60.0, 0.2])   # kp ki kd (tuned in simulation)
-    ap.add_argument("--counts-per-rev", type=float, default=1440.0)
-    ap.add_argument("--dt", type=float, default=1e-3)
+    ap.add_argument("--mode", choices=["position", "velocity"], default="position")
+    ap.add_argument("--gains", type=float, nargs=2, default=None)      # kp ki
+    ap.add_argument("--counts-per-rev", type=float, default=8256.0)
+    ap.add_argument("--dt", type=float, default=0.01)
+    ap.add_argument("--deadband", type=float, default=0.0)
+    ap.add_argument("--anti-windup", type=int, default=1)
     ap.add_argument("--gain-scale", type=float, default=1.0)
     a = ap.parse_args()
-    kp, ki, kd = (g * a.gain_scale for g in a.gains)
-    pid = PID(kp, ki, kd, a.dt, a.counts_per_rev)
+    kp, ki = (g * a.gain_scale for g in (a.gains or DEFAULT_GAINS[a.mode]))
+    ctrl = ArduinoController(a.mode, kp, ki, a.dt, a.counts_per_rev, a.deadband, bool(a.anti_windup))
 
     sock = socket.create_connection(("127.0.0.1", a.port), timeout=10)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -61,9 +82,9 @@ def main():
         parts = line.split()
         if not parts or parts[0] == "END":
             break
-        _, step, _t, counts, target = parts
-        duty = pid.update(int(counts), float(target))
-        f.write(f"CMD {step} {duty:.17g}\n"); f.flush()
+        _, step, _t, counts, adc = parts
+        pwm, in1, in2 = ctrl.update(int(counts), int(adc))
+        f.write(f"CMD {step} {pwm} {in1} {in2}\n"); f.flush()
     sock.close()
 
 
